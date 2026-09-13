@@ -278,7 +278,7 @@ function loadSettings(){
   }catch(e){ return defaultSettings(); }
 }
 function defaultSettings(){
-  return { currency:'$', accountBalance:0, defaultSymbol:'XAUUSD', defaultRiskPercent:1 };
+  return { currency:'$', accountBalance:0, defaultSymbol:'XAUUSD', defaultRiskPercent:1, geminiApiKey:'', geminiModel:'gemini-2.0-flash' };
 }
 function saveSettings(){ localStorage.setItem(DB_SETTINGS, JSON.stringify(settings)); }
 
@@ -639,6 +639,17 @@ function viewTradeForm(editId){
     + '<a class="btn btn-ghost" href="#'+(editing? 'detail/'+editing.id : 'open')+'">ยกเลิก</a></div>'
   + '<form id="trade-form" data-id="'+t.id+'" data-mode="'+(editing?'edit':'new')+'">'
 
+  + '<div class="card" style="border-color:var(--gold-dim);margin-bottom:14px;">'
+  + '<div class="section-title" style="margin-top:0;padding-top:0;border-top:none;">นำเข้าจากภาพกราฟ (AI Autofill)</div>'
+  + '<p class="help-text" style="margin-top:0;">อัปโหลดภาพกราฟที่ขีด Entry/SL/TP ไว้ (หรือมี Order เปิดอยู่) ให้ AI ช่วยอ่านราคาและติ๊ก Checklist เบื้องต้นให้ — ตรวจสอบความถูกต้องทุกครั้งก่อนบันทึก ใช้ Google Gemini API (ตั้งค่า API Key ได้ที่หน้า Reports)</p>'
+  + '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">'
+    + '<input type="file" accept="image/*" id="ai-shot-input">'
+    + '<button type="button" class="btn btn-gold btn-sm" id="ai-analyze-btn" disabled>วิเคราะห์ภาพด้วย AI</button>'
+    + '<span id="ai-status" class="help-text" style="margin-top:0;"></span>'
+  + '</div>'
+  + '<div id="ai-shot-preview" style="margin-top:10px;"></div>'
+  + '</div>'
+
   + '<div class="card">'
   + '<div class="section-title">1. ข้อมูลการเทรด</div>'
   + '<div class="form-grid">'
@@ -751,34 +762,35 @@ function radioRow(name, opts, value){
   ).join('') + '</div>';
 }
 
+function refreshChecklistUI(form){
+  const mc = form.querySelectorAll('input[data-scoregroup=mc]:checked').length;
+  const ec = form.querySelectorAll('input[data-scoregroup=ec]:checked').length;
+  const sn = form.querySelectorAll('input[data-scoregroup=sn]:checked').length;
+  document.getElementById('mc-score').textContent = mc+'/'+MARKET_CONTEXT_ITEMS.length;
+  document.getElementById('ec-score').textContent = ec+'/'+ENTRY_CONFIRMATION_ITEMS.length;
+  document.getElementById('sniper-num').textContent = sn+'/5';
+  const v = sniperVerdict(sn);
+  const pill = document.getElementById('sniper-pill');
+  pill.textContent = v.label;
+  pill.className = 'score-pill '+v.cls;
+  form.querySelectorAll('[data-checkitem]').forEach(el=>{
+    const cb = el.querySelector('input');
+    el.classList.toggle('checked', cb.checked);
+  });
+}
+function refreshPlannedRR(form){
+  const entry = num(form.entry.value), sl = num(form.sl.value), tp = num(form.tp.value);
+  const rr = calcPlannedRR(entry,sl,tp);
+  document.getElementById('plannedrr-out').textContent = rr? fmtN(rr,2)+'R' : '—';
+}
+
 function afterTradeFormRender(editId){
   const form = document.getElementById('trade-form');
   if(!form) return;
 
-  function updateScores(){
-    const mc = form.querySelectorAll('input[data-scoregroup=mc]:checked').length;
-    const ec = form.querySelectorAll('input[data-scoregroup=ec]:checked').length;
-    const sn = form.querySelectorAll('input[data-scoregroup=sn]:checked').length;
-    document.getElementById('mc-score').textContent = mc+'/'+MARKET_CONTEXT_ITEMS.length;
-    document.getElementById('ec-score').textContent = ec+'/'+ENTRY_CONFIRMATION_ITEMS.length;
-    document.getElementById('sniper-num').textContent = sn+'/5';
-    const v = sniperVerdict(sn);
-    const pill = document.getElementById('sniper-pill');
-    pill.textContent = v.label;
-    pill.className = 'score-pill '+v.cls;
-    form.querySelectorAll('[data-checkitem]').forEach(el=>{
-      const cb = el.querySelector('input');
-      el.classList.toggle('checked', cb.checked);
-    });
-  }
-  function updatePlannedRR(){
-    const entry = num(form.entry.value), sl = num(form.sl.value), tp = num(form.tp.value);
-    const rr = calcPlannedRR(entry,sl,tp);
-    document.getElementById('plannedrr-out').textContent = rr? fmtN(rr,2)+'R' : '—';
-  }
   form.addEventListener('change', e=>{
-    if(e.target.matches('input[type=checkbox]')) updateScores();
-    if(['entry','sl','tp'].includes(e.target.name)) updatePlannedRR();
+    if(e.target.matches('input[type=checkbox]')) refreshChecklistUI(form);
+    if(['entry','sl','tp'].includes(e.target.name)) refreshPlannedRR(form);
   });
 
   // tags
@@ -837,10 +849,148 @@ function afterTradeFormRender(editId){
     });
   }
 
+  // AI Autofill from screenshot
+  let aiPendingDataUrl = null;
+  const aiInput = document.getElementById('ai-shot-input');
+  const aiBtn = document.getElementById('ai-analyze-btn');
+  const aiStatus = document.getElementById('ai-status');
+  if(aiInput){
+    aiInput.addEventListener('change', async e=>{
+      const file = e.target.files[0]; if(!file) return;
+      aiPendingDataUrl = await fileToCompressedDataUrl(file, 1280, 0.85);
+      document.getElementById('ai-shot-preview').innerHTML = '<img class="thumb" style="width:160px;height:104px;" src="'+aiPendingDataUrl+'">';
+      aiBtn.disabled = false;
+      aiStatus.textContent = '';
+    });
+  }
+  if(aiBtn){
+    aiBtn.addEventListener('click', async ()=>{
+      if(!aiPendingDataUrl) return;
+      if(!settings.geminiApiKey){
+        alert('ยังไม่ได้ตั้งค่า Gemini API Key — ไปที่หน้า Reports เพื่อกรอก API Key ก่อนใช้ฟีเจอร์นี้');
+        return;
+      }
+      aiBtn.disabled = true;
+      aiStatus.textContent = 'กำลังวิเคราะห์ภาพ...';
+      try{
+        const result = await analyzeChartImage(aiPendingDataUrl);
+        applyAIResultToForm(form, result, aiPendingDataUrl);
+        aiStatus.textContent = '';
+        toast('AI วิเคราะห์เสร็จแล้ว — ตรวจสอบข้อมูลก่อนบันทึก');
+      }catch(err){
+        console.error(err);
+        aiStatus.textContent = '';
+        alert('วิเคราะห์ภาพไม่สำเร็จ: ' + err.message);
+      }finally{
+        aiBtn.disabled = false;
+      }
+    });
+  }
+
   form.addEventListener('submit', e=>{
     e.preventDefault();
     saveTradeFromForm(form, editId);
   });
+}
+
+/* ---------- AI Autofill (Google Gemini Vision) ---------- */
+async function analyzeChartImage(dataUrl){
+  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/s);
+  if(!match) throw new Error('รูปแบบภาพไม่ถูกต้อง');
+  const mimeType = match[1], base64 = match[2];
+  const model = settings.geminiModel || 'gemini-2.0-flash';
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(settings.geminiApiKey);
+
+  const prompt = 'You are analyzing a XAUUSD (gold) trading chart screenshot from a trader using Smart Money Concepts (SMC) / "Sniper Setup" methodology. '
+    + 'Extract what is VISIBLE and CLEARLY LABELED on the chart only. Do not guess or invent numbers. '
+    + 'If a price level (entry/SL/TP) is not clearly marked with a line and price label or an open order/pending order panel, set it to null. '
+    + 'Only set a boolean pattern flag to true if there is clear visual evidence (e.g. a drawn box/label for FVG, Order Block, a marked swing sweep, a CHoCH/BOS label, an annotated liquidity zone). Default to false when uncertain. '
+    + 'Return ONLY a single JSON object with exactly this shape (no markdown, no explanation): '
+    + '{"symbol": string|null, "timeframe": one of ["M1","M5","M15","M30","H1","H4","D1"]|null, "direction": "Buy"|"Sell"|null, "entry": number|null, "sl": number|null, "tp": number|null, '
+    + '"session": one of ["Asia","London","NY","London/NY Overlap"]|null, "bias": "Bullish"|"Bearish"|null, "confidence": integer 1-5|null, '
+    + '"marketContext": {"trend":bool,"range":bool,"premiumDiscount":bool,"liquidity":bool,"sessionConfirmed":bool,"htfBias":bool}, '
+    + '"entryConfirmation": {"liquiditySweep":bool,"fakeBreakout":bool,"chochMss":bool,"displacement":bool,"fvg":bool,"orderBlock":bool,"retest":bool,"prevHighLow":bool}, '
+    + '"sniperScore": {"liquidityTarget":bool,"sweepFakeBreak":bool,"chochMss":bool,"displacement":bool,"fvgObRetrace":bool}, '
+    + '"tags": [string, ...] (short tags like "Sweep","MSS","FVG","OB","London","NY","Trend","Reversal"), '
+    + '"entryPoint": string (one short sentence describing where price is expected to be entered, in Thai), '
+    + '"reason": string (one short sentence reasoning for the setup, in Thai) }';
+
+  const body = {
+    contents: [{ parts: [ {text: prompt}, {inline_data: {mime_type: mimeType, data: base64}} ] }],
+    generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
+  };
+
+  const res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if(!res.ok){
+    let msg = 'HTTP '+res.status;
+    try{ const errJson = await res.json(); if(errJson.error && errJson.error.message) msg = errJson.error.message; }catch(e){}
+    throw new Error(msg);
+  }
+  const data = await res.json();
+  const text = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  if(!text) throw new Error('AI ไม่ตอบข้อมูลกลับมา (อาจถูกบล็อกด้วย safety filter)');
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if(!jsonMatch) throw new Error('อ่านผลลัพธ์จาก AI ไม่ได้');
+  return JSON.parse(jsonMatch[0]);
+}
+
+function setChipsUI(containerId, hiddenId, dataAttr, values){
+  const hidden = document.getElementById(hiddenId);
+  const container = document.getElementById(containerId);
+  if(!hidden || !container) return;
+  const vals = Array.isArray(values)? values : [];
+  hidden.value = JSON.stringify(vals);
+  container.querySelectorAll('[data-'+dataAttr+']').forEach(chip=>{
+    chip.classList.toggle('on', vals.includes(chip.dataset[dataAttr.replace(/-([a-z])/g, (m,c)=>c.toUpperCase())]));
+  });
+  vals.forEach(v=>{
+    if(!container.querySelector('[data-'+dataAttr+'="'+v.replace(/"/g,'')+'"]')){
+      const span = document.createElement('span');
+      span.className = 'psych-chip on';
+      span.dataset[dataAttr.replace(/-([a-z])/g, (m,c)=>c.toUpperCase())] = v;
+      span.textContent = (dataAttr==='tag'? '#'+v : v);
+      container.appendChild(span);
+    }
+  });
+}
+
+function setChecklistUI(form, prefix, items, values){
+  if(!values) return;
+  items.forEach(it=>{
+    const el = form.querySelector('input[name="'+prefix+'_'+it.key+'"]');
+    if(el) el.checked = !!values[it.key];
+  });
+}
+
+function applyAIResultToForm(form, r, screenshotDataUrl){
+  if(r.symbol) form.symbol.value = r.symbol;
+  if(r.timeframe && TIMEFRAMES.includes(r.timeframe)) form.timeframe.value = r.timeframe;
+  if(r.direction==='Buy'||r.direction==='Sell') form.direction.value = r.direction;
+  if(r.session && SESSIONS.includes(r.session)) form.session.value = r.session;
+  if(typeof r.entry==='number') form.entry.value = r.entry;
+  if(typeof r.sl==='number') form.sl.value = r.sl;
+  if(typeof r.tp==='number') form.tp.value = r.tp;
+  if(r.bias==='Bullish'||r.bias==='Bearish') form.before_bias.value = r.bias;
+  if(r.entryPoint) form.before_entryPoint.value = r.entryPoint;
+  if(r.reason) form.before_reason.value = r.reason;
+  if(r.confidence>=1 && r.confidence<=5){
+    const radio = form.querySelector('input[name=before_confidence][value="'+r.confidence+'"]');
+    if(radio) radio.checked = true;
+  }
+
+  setChecklistUI(form, 'mc', MARKET_CONTEXT_ITEMS, r.marketContext);
+  setChecklistUI(form, 'ec', ENTRY_CONFIRMATION_ITEMS, r.entryConfirmation);
+  setChecklistUI(form, 'sn', SNIPER_ITEMS, r.sniperScore);
+
+  if(Array.isArray(r.tags) && r.tags.length) setChipsUI('tag-chips', 'tags_json', 'tag', r.tags);
+
+  if(screenshotDataUrl){
+    document.getElementById('before_screenshot').value = screenshotDataUrl;
+    document.getElementById('before-shot-preview').innerHTML = '<img class="thumb" style="width:140px;height:90px;" src="'+screenshotDataUrl+'">';
+  }
+
+  refreshChecklistUI(form);
+  refreshPlannedRR(form);
 }
 
 function readChecklist(form, prefix, items){
@@ -1316,6 +1466,12 @@ function viewReports(){
       + field('defaultSymbol','Symbol เริ่มต้น','text', settings.defaultSymbol)
       + field('defaultRiskPercent','Risk % เริ่มต้น','number', settings.defaultRiskPercent, '0.01')
     + '</div>'
+    + '<div class="section-title">AI Autofill (Google Gemini)</div>'
+    + '<div class="form-grid" style="grid-template-columns:1fr 1fr;">'
+      + field('geminiApiKey','Gemini API Key','password', settings.geminiApiKey, null, 2)
+      + field('geminiModel','Gemini Model', 'text', settings.geminiModel)
+    + '</div>'
+    + '<p class="help-text">ขอ API Key ฟรีได้ที่ <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> — Key จะถูกเก็บไว้ใน Local Storage ของเบราว์เซอร์เครื่องนี้เท่านั้น ไม่ถูกส่งไปที่อื่นนอกจาก Google API โดยตรงตอนวิเคราะห์ภาพ</p>'
     + '<button class="btn btn-gold" style="margin-top:12px;" type="submit">บันทึกการตั้งค่า</button>'
     + '</form>'
   + '</div>'
@@ -1350,6 +1506,8 @@ function wireGlobalActions(){
       settings.accountBalance = num(settingsForm.accountBalance.value) || 0;
       settings.defaultSymbol = settingsForm.defaultSymbol.value || 'XAUUSD';
       settings.defaultRiskPercent = num(settingsForm.defaultRiskPercent.value) || 1;
+      settings.geminiApiKey = settingsForm.geminiApiKey.value.trim();
+      settings.geminiModel = settingsForm.geminiModel.value.trim() || 'gemini-2.0-flash';
       saveSettings();
       toast('บันทึกการตั้งค่าแล้ว');
     });
